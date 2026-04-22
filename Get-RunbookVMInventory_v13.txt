@@ -1,0 +1,599 @@
+<#
+.SYNOPSIS
+    Collects VM inventory data from multiple vCenters, maintains a JSON cache,
+    and exports a clean JSON file for Copilot consumption.
+
+.DESCRIPTION
+    Processes all vCenters defined in the CONFIGURATION section in a single run.
+    Credentials are prompted once and reused for all vCenters.
+
+    Cache behaviour: accumulates across all vCenters. VMs from VC1 are not flagged
+    missing when processing VC2 — missing-flag logic is scoped per vCenter.
+    Cache is saved after each vCenter completes so a failure midway does not
+    lose data already collected.
+
+    Export is written once at the end after all vCenters are processed.
+
+    RDM NAA numbers are sourced from Get-HardDisk ScsiCanonicalName (one bulk call
+    per vCenter) — reliable across all storage types and vCenter versions.
+
+    SCSI LUN ID and SAN ID are resolved by querying one representative host per
+    cluster. All hosts in a cluster share the same storage zoning, so one host
+    gives complete LUN coverage for every VM in that cluster.
+
+.PARAMETER OutputPath
+    UNC or local path to the share where the JSON cache and export will be written.
+
+.EXAMPLE
+    .\Get-RunbookVMInventory_v13.ps1 -OutputPath "\\server\share\VMInventory"
+#>
+
+[CmdletBinding()]
+param (
+    [Parameter(Mandatory)]
+    [string]$OutputPath
+)
+
+# ══ CONFIGURATION — edit this section ════════════════════════════════════════
+# Add or remove vCenter servers below. Use the same FQDN/IP on every run
+# as the value is stored as the vCenter identifier in the cache.
+$vCenterServers = @(
+    'vcenter01.domain.local'
+    'vcenter02.domain.local'
+    'vcenter03.domain.local'
+)
+# ═════════════════════════════════════════════════════════════════════════════
+
+$ErrorActionPreference = 'Stop'
+
+# ── File paths ────────────────────────────────────────────────────────────────
+$JsonCachePath  = Join-Path $OutputPath 'VMInventory_Cache.json'
+$JsonExportPath = Join-Path $OutputPath 'VMInventory_Export.json'
+
+# ── Helper: Parse Primary Location from hostname ──────────────────────────────
+# Hostname format: xxxxd90xxxxx — characters 5-7 (1-indexed) = index 4, length 3
+function Get-PrimaryLocation {
+    param ([string]$Hostname)
+    if ($Hostname.Length -ge 7) { return $Hostname.Substring(4, 3) }
+    return $null
+}
+
+# ── Helper: Parse SC from datastore name ─────────────────────────────────────
+# Pattern: xxx_sc[1-5]_xxx — always sc + single digit, never above sc5
+function Get-SCFromDatastore {
+    param ([string]$DatastoreName)
+    if ($DatastoreName -match '_(?i)(sc[1-5])_') { return $Matches[1].ToUpper() }
+    return $null
+}
+
+# ── Helper: Convert prefix length to dotted-decimal subnet mask ──────────────
+function ConvertTo-SubnetMask {
+    param ([int]$PrefixLength)
+    if ($PrefixLength -lt 0 -or $PrefixLength -gt 32) { return $null }
+    if ($PrefixLength -eq 0) { return '0.0.0.0' }
+    $bits   = [string]::new('1', $PrefixLength) + [string]::new('0', 32 - $PrefixLength)
+    $octets = for ($i = 0; $i -lt 4; $i++) {
+        [Convert]::ToInt32($bits.Substring($i * 8, 8), 2)
+    }
+    return $octets -join '.'
+}
+
+# ── Helper: Build VM inventory record from in-memory data only ───────────────
+function Get-VMInventoryRecord {
+    param (
+        $VM,
+        [string]   $VCenterName,
+        [hashtable]$Lookups
+    )
+
+    $cpuCores = $VM.NumCpu
+    $ramGB    = [math]::Round($VM.MemoryGB, 0)
+    $os       = $VM.ExtensionData.Config.GuestFullName
+
+    # Default gateway — from VMware Tools IpStack default route (VM-level, primary adapter).
+    # Also build an IP→prefix map from IpStack as a fallback for older Tools that don't
+    # populate Guest.Net.IpConfig (e.g. Windows 2012).
+    $defaultGateway   = $null
+    $ipStackPrefixMap = @{}
+    try {
+        $ipStack = $VM.ExtensionData.Guest.IpStack
+        if ($ipStack) {
+            $defaultRoute = $ipStack |
+                ForEach-Object { $_.IpRouteConfig.IpRoute } |
+                Where-Object { $_.Network -eq '0.0.0.0' -and $_.PrefixLength -eq 0 } |
+                Select-Object -First 1
+            if ($defaultRoute) { $defaultGateway = $defaultRoute.Gateway.IpAddress }
+
+            $ipStack | ForEach-Object { $_.IpConfig.IpAddress } |
+                Where-Object { $_ } |
+                ForEach-Object { $ipStackPrefixMap[$_.IpAddress] = $_.PrefixLength }
+        }
+    } catch {}
+
+    # Build per-NIC IP lookup from Guest.Net — keyed by MAC address.
+    $guestNetByMac = @{}
+    if ($VM.ExtensionData.Guest.Net) {
+        foreach ($net in $VM.ExtensionData.Guest.Net) {
+            if ($net.MacAddress) { $guestNetByMac[$net.MacAddress.ToLower()] = $net }
+        }
+    }
+
+    # Cluster + Datacenter — resolved via pre-fetched host→cluster and host→DC maps.
+    $hostKey    = $VM.ExtensionData.Runtime.Host?.ToString()
+    $cluster    = if ($hostKey) { $Lookups.HostClusterMap[$hostKey] } else { $null }
+    $datacenter = if ($hostKey) { $Lookups.HostDCMap[$hostKey] }     else { $null }
+
+    # NICs — extracted from Config.Hardware.Device (already in ExtensionData, no API call).
+    $nics = @()
+    foreach ($device in $VM.ExtensionData.Config.Hardware.Device) {
+        $pgName = switch ($device.Backing?.GetType().Name) {
+            'VirtualEthernetCardNetworkBackingInfo' {
+                $device.Backing.DeviceName
+            }
+            'VirtualEthernetCardDistributedVirtualPortBackingInfo' {
+                $Lookups.DVPGKeyToName[$device.Backing.Port.PortgroupKey]
+            }
+            default { $null }
+        }
+        if ($null -eq $pgName) { continue }
+
+        $nicIP   = $null
+        $nicMask = $null
+        $netInfo = if ($device.MacAddress) { $guestNetByMac[$device.MacAddress.ToLower()] } else { $null }
+        if ($netInfo) {
+            if ($netInfo.IpConfig -and $netInfo.IpConfig.IpAddress) {
+                $ipEntry = @($netInfo.IpConfig.IpAddress) |
+                    Where-Object { $_.IpAddress -match '^\d+\.\d+\.\d+\.\d+$' } |
+                    Select-Object -First 1
+                if ($ipEntry) {
+                    $nicIP   = $ipEntry.IpAddress
+                    $nicMask = ConvertTo-SubnetMask -PrefixLength $ipEntry.PrefixLength
+                }
+            }
+            if (-not $nicIP -and $netInfo.IpAddress) {
+                $nicIP = @($netInfo.IpAddress) |
+                    Where-Object { $_ -match '^\d+\.\d+\.\d+\.\d+$' } |
+                    Select-Object -First 1
+            }
+            if ($nicIP -and -not $nicMask -and $ipStackPrefixMap.ContainsKey($nicIP)) {
+                $nicMask = ConvertTo-SubnetMask -PrefixLength $ipStackPrefixMap[$nicIP]
+            }
+        }
+
+        $nics += [ordered]@{
+            PortGroup  = $pgName
+            VDS        = $Lookups.PgToVds[$pgName]
+            IPAddress  = $nicIP
+            SubnetMask = $nicMask
+        }
+    }
+
+    $ipAddress  = ($nics | Where-Object { $_.IPAddress  } | Select-Object -First 1).IPAddress
+    $subnetMask = ($nics | Where-Object { $_.SubnetMask } | Select-Object -First 1).SubnetMask
+
+    # Datastore + DatastoreCluster
+    $datastoreName    = $null
+    $datastoreCluster = $null
+    $sc               = $null
+    foreach ($dsMoRef in $VM.ExtensionData.Datastore) {
+        $dsName = $Lookups.DSNameMap[$dsMoRef.ToString()]
+        if ($dsName -and $dsName -notmatch 'vswap') {
+            $datastoreName    = $dsName
+            $datastoreCluster = $Lookups.DSStoragePodMap[$dsMoRef.ToString()]
+            $sc               = Get-SCFromDatastore -DatastoreName $datastoreName
+            break
+        }
+    }
+
+    # Disks
+    $disks = @()
+    foreach ($device in $VM.ExtensionData.Config.Hardware.Device) {
+        if ($device.GetType().Name -ne 'VirtualDisk') { continue }
+
+        $filename = $device.Backing?.FileName
+        if (-not $filename -or $filename -match 'vswap') { continue }
+
+        $backingTypeName = $device.Backing.GetType().Name
+        $isRDM           = $backingTypeName -like '*RawDiskMapping*'
+
+        $diskTypeName = switch -Wildcard ($backingTypeName) {
+            '*FlatVer*'        { 'Flat' }
+            '*RawDiskMapping*' {
+                if ($device.Backing.CompatibilityMode -eq 'physicalMode') { 'RawPhysical' } else { 'RawVirtual' }
+            }
+            '*SparseVer*'      { 'Sparse' }
+            default            { $backingTypeName }
+        }
+
+        $sizeGB      = [math]::Round($device.CapacityInKB / 1048576, 0)
+        $scsiMapping = "$($device.ControllerKey):$($device.UnitNumber)"
+        $naaNumber   = $null
+        $lunId       = $null
+
+        if ($isRDM) {
+            $naaNumber = $Lookups.RdmNaaLookup["$($VM.Name)|$scsiMapping"]
+            if ($naaNumber) { $lunId = $Lookups.CanonicalLunIdMap[$naaNumber] }
+        }
+
+        $disks += [ordered]@{
+            FileName              = $filename
+            SizeGB                = $sizeGB
+            DiskType              = $diskTypeName
+            IsRDM                 = $isRDM
+            NAANumber             = $naaNumber
+            SCSIControllerMapping = $scsiMapping
+            LUN                   = $lunId
+            LUN_SVM               = if ($naaNumber) { $Lookups.CanonicalSanIdMap[$naaNumber] } else { $null }
+        }
+    }
+
+    return [ordered]@{
+        Hostname         = $VM.Name
+        OS               = $os
+        CPUCores         = $cpuCores
+        RAMGB            = $ramGB
+        vCenter          = $VCenterName
+        ESXCluster       = $cluster
+        IPAddress        = $ipAddress
+        SubnetMask       = $subnetMask
+        DefaultGateway   = $defaultGateway
+        NICs             = $nics
+        Datacenter       = $datacenter
+        VMwareDatastore  = $datastoreName
+        DatastoreCluster = $datastoreCluster
+        SC               = $sc
+        PrimaryLocation  = Get-PrimaryLocation -Hostname $VM.Name
+        PowerState       = $VM.PowerState.ToString()
+        IsDecommissioned = $VM.Name -match '(?i)decom'
+        Disks            = $disks
+        NoLongerPresent  = $false
+        LastSeen         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        LastChanged      = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+    }
+}
+
+# ── Helper: Compare two records, ignoring audit-only fields ───────────────────
+function Compare-VMRecord {
+    param ($Existing, $New)
+    $skipFields = @('LastSeen', 'LastChanged', 'NoLongerPresent')
+    foreach ($field in $New.Keys) {
+        if ($field -in $skipFields) { continue }
+        $existingVal = $Existing.$field | ConvertTo-Json -Compress -Depth 5
+        $newVal      = $New.$field      | ConvertTo-Json -Compress -Depth 5
+        if ($existingVal -ne $newVal) { return $true }
+    }
+    return $false
+}
+
+# ── Helper: Convert PSCustomObject (from JSON deserialisation) to ordered hashtable ──
+function ConvertTo-OrderedHashtable {
+    param ($Object)
+    $ht = [ordered]@{}
+    foreach ($prop in $Object.PSObject.Properties) { $ht[$prop.Name] = $prop.Value }
+    return $ht
+}
+
+# ══ Main ══════════════════════════════════════════════════════════════════════
+
+if (-not (Test-Path $OutputPath)) {
+    New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
+    Write-Host "Created output directory: $OutputPath"
+}
+
+# Load existing JSON cache
+$cache = [ordered]@{}
+if (Test-Path $JsonCachePath) {
+    Write-Host "Loading existing cache from: $JsonCachePath"
+    $cacheArray = Get-Content $JsonCachePath -Raw | ConvertFrom-Json
+    foreach ($entry in $cacheArray) {
+        $ht = ConvertTo-OrderedHashtable -Object $entry
+        $cache[$ht.Hostname] = $ht
+    }
+    Write-Host "  $($cache.Count) VMs loaded from cache"
+} else {
+    Write-Host "No existing cache found — performing full initial pull"
+}
+
+# Single credential prompt — reused for all vCenters
+$credential = Get-Credential -Message "Enter vCenter credentials (used for all vCenters)"
+
+# ── Process each vCenter ──────────────────────────────────────────────────────
+$totalNew     = 0
+$totalChanged = 0
+$totalMissing = 0
+
+foreach ($vcServer in $vCenterServers) {
+    Write-Host "`n════════════════════════════════════════"
+    Write-Host "Processing vCenter: $vcServer"
+    Write-Host "════════════════════════════════════════"
+
+    $connected = $false
+    try {
+        $null = Connect-VIServer -Server $vcServer -Credential $credential -ErrorAction Stop
+        $connected = $true
+        Write-Host "Connected successfully"
+
+        # ── Pre-fetch lookup data (1-6) ───────────────────────────────────────
+        Write-Host "`nPre-fetching inventory data..."
+
+        # 1. Portgroup name → VDS name
+        $pgToVds = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            Get-VDPortgroup -ErrorAction SilentlyContinue | ForEach-Object {
+                $pgToVds[$_.Name] = $_.VDSwitch.Name
+            }
+            Write-Host "  [$($pgToVds.Count)] VDS portgroups"
+        } catch { Write-Host "  Warning: VDS portgroup data unavailable" }
+
+        # 2. DVPortgroup key → portgroup name
+        $dvpgKeyToName = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            Get-View -ViewType DistributedVirtualPortgroup -Property @('Name', 'Key') -ErrorAction SilentlyContinue |
+                ForEach-Object { $dvpgKeyToName[$_.Key] = $_.Name }
+            Write-Host "  [$($dvpgKeyToName.Count)] DVPortgroup keys"
+        } catch { Write-Host "  Warning: DVPortgroup key data unavailable" }
+
+        # 3. Host MoRef → cluster name
+        $hostClusterMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            Get-View -ViewType ClusterComputeResource -Property @('Name', 'Host') -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $clName = $_.Name
+                    foreach ($hostRef in $_.Host) { $hostClusterMap[$hostRef.ToString()] = $clName }
+                }
+            Write-Host "  [$($hostClusterMap.Count)] hosts mapped to clusters"
+        } catch { Write-Host "  Warning: cluster data unavailable" }
+
+        # 4. Host MoRef → datacenter name
+        $hostDCMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            Get-View -ViewType Datacenter -Property @('Name', 'HostFolder') -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $dcName = $_.Name
+                    Get-View -SearchRoot $_.HostFolder -ViewType HostSystem -Property @('Name') -ErrorAction SilentlyContinue |
+                        ForEach-Object { $hostDCMap[$_.MoRef.ToString()] = $dcName }
+                }
+            Write-Host "  [$($hostDCMap.Count)] hosts mapped to datacenters"
+        } catch { Write-Host "  Warning: datacenter data unavailable" }
+
+        # 5. Datastore MoRef → datastore name
+        $dsNameMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            Get-View -ViewType Datastore -Property @('Name') -ErrorAction SilentlyContinue |
+                ForEach-Object { $dsNameMap[$_.MoRef.ToString()] = $_.Name }
+            Write-Host "  [$($dsNameMap.Count)] datastores"
+        } catch { Write-Host "  Warning: datastore data unavailable" }
+
+        # 6. Datastore MoRef → datastore cluster (StoragePod) name
+        $dsStoragePodMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            Get-View -ViewType StoragePod -Property @('Name', 'ChildEntity') -ErrorAction SilentlyContinue |
+                ForEach-Object {
+                    $podName = $_.Name
+                    foreach ($childRef in $_.ChildEntity) { $dsStoragePodMap[$childRef.ToString()] = $podName }
+                }
+            Write-Host "  [$($dsStoragePodMap.Count)] datastores mapped to datastore clusters"
+        } catch { Write-Host "  Warning: datastore cluster data unavailable" }
+
+        # ── Fetch all VMs ─────────────────────────────────────────────────────
+        Write-Host "`nRetrieving all VMs..."
+        $allVMs = @(Get-VM -ErrorAction Stop)
+        Write-Host "  $($allVMs.Count) VMs retrieved"
+
+        $filteredVMs = @($allVMs | Where-Object {
+            $_.Name -notlike 'vCLS*' -and
+            $_.ExtensionData.Config.ManagedBy?.type -ne 'placeholderVm'
+        })
+        Write-Host "  $($filteredVMs.Count) VMs after filtering vCLS and SRM placeholders"
+
+        # 7. RDM NAA — bulk Get-HardDisk using ScsiCanonicalName (reliable across all
+        #    storage types; replaces brittle Backing.DeviceName string parsing)
+        $rdmNaaLookup = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            $allRdms = @($filteredVMs | Get-HardDisk -DiskType RawPhysical,RawVirtual -ErrorAction SilentlyContinue)
+            foreach ($rdm in $allRdms) {
+                $key = "$($rdm.Parent.Name)|$($rdm.ExtensionData.ControllerKey):$($rdm.ExtensionData.UnitNumber)"
+                if (-not $rdmNaaLookup.ContainsKey($key)) { $rdmNaaLookup[$key] = $rdm.ScsiCanonicalName }
+            }
+            Write-Host "  [$($rdmNaaLookup.Count)] RDM NAA mappings"
+        } catch { Write-Host "  Warning: RDM NAA lookup unavailable — $($_.Exception.Message)" }
+
+        # 8. SCSI LUN maps — one representative host per cluster
+        $canonicalLunIdMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $canonicalSanIdMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        try {
+            $seenClusters = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            $sampleHosts  = @(Get-VMHost -ErrorAction SilentlyContinue | Where-Object {
+                $clusterKey = if ($hostClusterMap.ContainsKey($_.Id)) { $hostClusterMap[$_.Id] } else { $_.Id }
+                $seenClusters.Add($clusterKey)
+            })
+            Write-Host "  Querying $($sampleHosts.Count) representative hosts ($($seenClusters.Count) clusters)"
+
+            $allScsiLuns = [System.Collections.Generic.List[object]]::new()
+            $batchSize   = 20
+            for ($i = 0; $i -lt $sampleHosts.Count; $i += $batchSize) {
+                $batch     = $sampleHosts[$i..([Math]::Min($i + $batchSize - 1, $sampleHosts.Count - 1))]
+                $batchLuns = @(Get-ScsiLun -VMHost $batch -ErrorAction SilentlyContinue)
+                foreach ($l in $batchLuns) { $allScsiLuns.Add($l) }
+            }
+
+            foreach ($lun in $allScsiLuns) {
+                if ($lun.RuntimeName -match ':L(\d+)$') {
+                    $lid = [int]$Matches[1]
+                    if ($lun.CanonicalName -and -not $canonicalLunIdMap.ContainsKey($lun.CanonicalName)) {
+                        $canonicalLunIdMap[$lun.CanonicalName] = $lid
+                    }
+                }
+            }
+
+            $allLunPaths = [System.Collections.Generic.List[object]]::new()
+            $lunArray    = @($allScsiLuns)
+            for ($i = 0; $i -lt $lunArray.Count; $i += 200) {
+                $batch      = $lunArray[$i..([Math]::Min($i + 199, $lunArray.Count - 1))]
+                $batchPaths = @(Get-ScsiLunPath -ScsiLun $batch -ErrorAction SilentlyContinue)
+                foreach ($p in $batchPaths) { $allLunPaths.Add($p) }
+            }
+            foreach ($path in $allLunPaths) {
+                $canonicalName = $path.ScsiLun?.CanonicalName
+                $sanId         = $path.SanId
+                if ($canonicalName -and $sanId -and -not $canonicalSanIdMap.ContainsKey($canonicalName)) {
+                    $canonicalSanIdMap[$canonicalName] = $sanId
+                }
+            }
+            Write-Host "  [$($canonicalLunIdMap.Count)] SCSI LUNs, [$($canonicalSanIdMap.Count)] LUN paths"
+        } catch { Write-Host "  Warning: SCSI LUN data unavailable — $($_.Exception.Message)" }
+
+        $lookups = @{
+            PgToVds           = $pgToVds
+            DVPGKeyToName     = $dvpgKeyToName
+            HostClusterMap    = $hostClusterMap
+            HostDCMap         = $hostDCMap
+            DSNameMap         = $dsNameMap
+            DSStoragePodMap   = $dsStoragePodMap
+            CanonicalLunIdMap = $canonicalLunIdMap
+            CanonicalSanIdMap = $canonicalSanIdMap
+            RdmNaaLookup      = $rdmNaaLookup
+        }
+
+        $newCount     = 0
+        $changedCount = 0
+        $currentNames = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+        )
+
+        foreach ($vm in $filteredVMs) {
+            $null = $currentNames.Add($vm.Name)
+            Write-Verbose "Processing: $($vm.Name)"
+
+            $record = Get-VMInventoryRecord -VM $vm -VCenterName $vcServer -Lookups $lookups
+
+            if (-not $cache.Contains($vm.Name)) {
+                $cache[$vm.Name] = $record
+                $newCount++
+                Write-Host "  [NEW]     $($vm.Name)"
+            } else {
+                $existing = $cache[$vm.Name]
+                if (Compare-VMRecord -Existing $existing -New $record) {
+                    $record.LastChanged = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                    $cache[$vm.Name]    = $record
+                    $changedCount++
+                    Write-Host "  [UPDATED] $($vm.Name)"
+                } else {
+                    $cache[$vm.Name].LastSeen        = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+                    $cache[$vm.Name].NoLongerPresent = $false
+                }
+            }
+        }
+
+        # Flag VMs from THIS vCenter that are no longer present
+        $missingCount = 0
+        foreach ($cachedName in @($cache.Keys)) {
+            if ($cache[$cachedName].vCenter -ne $vcServer) { continue }
+            if (-not $currentNames.Contains($cachedName)) {
+                if (-not $cache[$cachedName].NoLongerPresent) {
+                    $cache[$cachedName].NoLongerPresent = $true
+                    $missingCount++
+                    Write-Host "  [MISSING] $cachedName"
+                }
+            }
+        }
+
+        $totalNew     += $newCount
+        $totalChanged += $changedCount
+        $totalMissing += $missingCount
+        Write-Host "`n$vcServer summary: $newCount new | $changedCount updated | $missingCount newly missing"
+
+        # Save cache after each vCenter — protects data if a later VC fails
+        Write-Host "Saving cache..."
+        ConvertTo-Json -InputObject @($cache.Values) -Depth 10 | Set-Content -Path $JsonCachePath -Encoding UTF8
+        Write-Host "  Cache saved ($($cache.Count) total VMs)"
+
+    } catch {
+        Write-Host "ERROR processing $vcServer — $($_.Exception.Message)"
+        Write-Host "Continuing to next vCenter..."
+    } finally {
+        if ($connected) {
+            try { Disconnect-VIServer -Server $vcServer -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+            Write-Host "Disconnected from $vcServer"
+        }
+    }
+}
+
+# ── Export clean JSON once — after all vCenters are processed ─────────────────
+Write-Host "`n════════════════════════════════════════"
+Write-Host "Overall summary: $totalNew new | $totalChanged updated | $totalMissing newly missing"
+Write-Host "Exporting JSON to: $JsonExportPath"
+
+$exportList  = [System.Collections.Generic.List[object]]::new()
+$exportedVMs = 0
+
+foreach ($entry in $cache.Values) {
+    if ($entry.NoLongerPresent) { continue }
+    $exportedVMs++
+
+    $diskExport = @(foreach ($disk in @($entry.Disks)) {
+        $ds = $null
+        if ($disk.FileName -match '^\[(.+?)\]') { $ds = $Matches[1] }
+        [ordered]@{
+            SizeGB                = $disk.SizeGB
+            DiskType              = $disk.DiskType
+            Datastore             = $ds
+            IsRDM                 = $disk.IsRDM
+            NAANumber             = $disk.NAANumber
+            SCSIControllerMapping = $disk.SCSIControllerMapping
+            LUN                   = $disk.LUN
+            LUN_SVM               = $disk.LUN_SVM
+        }
+    })
+
+    $nicExport = @()
+    if ($null -ne $entry.NICs) {
+        $nicIndex  = 0
+        $nicExport = @($entry.NICs | ForEach-Object {
+            $nic = [ordered]@{
+                PortGroup  = $_.PortGroup
+                VDS        = $_.VDS
+                IPAddress  = $_.IPAddress
+                SubnetMask = $_.SubnetMask
+            }
+            if ($nicIndex -eq 0) { $nic['DefaultGateway'] = $entry.DefaultGateway }
+            $nicIndex++
+            $nic
+        })
+    } elseif ($null -ne $entry.PortGroups) {
+        $nicIndex  = 0
+        $nicExport = @($entry.PortGroups | ForEach-Object {
+            $nic = [ordered]@{ PortGroup = $_; VDS = $null; IPAddress = $null; SubnetMask = $null }
+            if ($nicIndex -eq 0) { $nic['DefaultGateway'] = $entry.DefaultGateway }
+            $nicIndex++
+            $nic
+        })
+    }
+
+    $isDecom = $entry.IsDecommissioned -or ($entry.Hostname -match '(?i)decom')
+
+    $exportList.Add([ordered]@{
+        Hostname         = $entry.Hostname
+        Status           = if ($isDecom) { 'Decommissioned' } else { 'Active' }
+        IsDecommissioned = $isDecom
+        OS               = $entry.OS
+        CPUCores         = $entry.CPUCores
+        RAMGB            = $entry.RAMGB
+        vCenter          = $entry.vCenter
+        ESXCluster       = $entry.ESXCluster
+        IPAddress        = $entry.IPAddress
+        SubnetMask       = $entry.SubnetMask
+        NICs             = $nicExport
+        Datacenter       = $entry.Datacenter
+        VMwareDatastore  = $entry.VMwareDatastore
+        DatastoreCluster = $entry.DatastoreCluster
+        SC               = $entry.SC
+        PrimaryLocation  = $entry.PrimaryLocation
+        PowerState       = $entry.PowerState
+        Disks            = $diskExport
+    })
+}
+
+ConvertTo-Json -InputObject @($exportList) -Depth 5 | Set-Content -Path $JsonExportPath -Encoding UTF8
+Write-Host "  JSON exported — $exportedVMs VMs"
+Write-Host "`nDone. Upload '$JsonExportPath' to Copilot along with the runbook."
