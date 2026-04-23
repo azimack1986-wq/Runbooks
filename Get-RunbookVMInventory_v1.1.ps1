@@ -5,7 +5,9 @@
     and exports a clean JSON file for Copilot consumption.
 
 .DESCRIPTION
-    Version 1.0 - Complete redesign for large vCenter environments.
+    Version 1.1 - RDM NAA lookup now resolved in-memory from ExtensionData
+    (eliminates Get-HardDisk API call). Per-host ping filter added to parallel
+    LUN scan. Real-time progress output added inside the parallel block.
 
     Processes all vCenters defined in the CONFIGURATION section.
     Credentials are prompted once and reused for all vCenters.
@@ -28,7 +30,7 @@
     UNC or local path where the JSON cache and export will be written.
 
 .EXAMPLE
-    .\Get-RunbookVMInventory_v1.0.ps1 -OutputPath "\\server\share\VMInventory"
+    .\Get-RunbookVMInventory_v1.1.ps1 -OutputPath "\\server\share\VMInventory"
 #>
 
 [CmdletBinding()]
@@ -451,16 +453,22 @@ foreach ($vcServer in $vCenterServers) {
         })
         Write-Host "  $($filteredVMs.Count) VMs after filtering vCLS and SRM placeholders"
 
-        Write-Host "`nBuilding RDM NAA lookup..."
+        Write-Host "`nBuilding RDM NAA lookup from VM ExtensionData..."
         $rdmNaaLookup = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
-        try {
-            $allRdms = @($filteredVMs | Get-HardDisk -DiskType RawPhysical,RawVirtual -ErrorAction Stop)
-            foreach ($rdm in $allRdms) {
-                $key = "$($rdm.Parent.Name)|$($rdm.ExtensionData.ControllerKey):$($rdm.ExtensionData.UnitNumber)"
-                if (-not $rdmNaaLookup.ContainsKey($key)) { $rdmNaaLookup[$key] = $rdm.ScsiCanonicalName }
+        foreach ($vm in $filteredVMs) {
+            foreach ($device in $vm.ExtensionData.Config.Hardware.Device) {
+                if ($device.GetType().Name -ne 'VirtualDisk') { continue }
+                if ($device.Backing.GetType().Name -notlike '*RawDiskMapping*') { continue }
+                $deviceName = $device.Backing.DeviceName
+                if (-not $deviceName) { continue }
+                $naa = if ($deviceName -match '(naa\.[0-9a-fA-F]+)') { $Matches[1] } else { $null }
+                if (-not $naa) { continue }
+                $scsiMapping = "$($device.ControllerKey):$($device.UnitNumber)"
+                $key = "$($vm.Name)|$scsiMapping"
+                if (-not $rdmNaaLookup.ContainsKey($key)) { $rdmNaaLookup[$key] = $naa }
             }
-            Write-Host "  [$($rdmNaaLookup.Count)] RDM NAA mappings"
-        } catch { Write-Host "  Warning: RDM NAA lookup failed — $($_.Exception.Message)" }
+        }
+        Write-Host "  [$($rdmNaaLookup.Count)] RDM NAA mappings"
 
         Write-Host "`nBuilding cluster host map..."
         $clusterHostMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -556,54 +564,70 @@ foreach ($vcServer in $vCenterServers) {
 
                 $hostsToTry = @($hostsForCluster | Select-Object -First $maxRetries)
 
-                Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum 2000)
+                $reachableHosts = [System.Collections.Generic.List[string]]::new()
+                foreach ($hName in $hostsToTry) {
+                    if (Test-Connection -TargetName $hName -Count 1 -TimeoutSeconds 2 -Quiet) {
+                        $reachableHosts.Add($hName)
+                    } else {
+                        Write-Host "  [LUN] $clKey — $hName unreachable (ping), skipping"
+                    }
+                }
+
                 $localServer = $null
-                try {
-                    $localServer = Connect-VIServer -Server $vcServer -Credential $cred -NotDefault -ErrorAction Stop
+                if ($reachableHosts.Count -eq 0) {
+                    Write-Host "  [LUN] $clKey — no reachable hosts found, skipping"
+                } else {
+                    Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum 2000)
+                    try {
+                        Write-Host "  [LUN] $clKey — connecting..."
+                        $localServer = Connect-VIServer -Server $vcServer -Credential $cred -NotDefault -ErrorAction Stop
 
-                    foreach ($hostName in $hostsToTry) {
-                        try {
-                            $triedHosts.Add($hostName)
-                            $hostObj  = Get-VMHost -Name $hostName -Server $localServer -ErrorAction Stop
-                            $scsiLuns = @(Get-ScsiLun -VMHost $hostObj -Server $localServer -ErrorAction Stop)
+                        foreach ($hostName in $reachableHosts) {
+                            try {
+                                $triedHosts.Add($hostName)
+                                Write-Host "  [LUN] $clKey — scanning $hostName"
+                                $hostObj  = Get-VMHost -Name $hostName -Server $localServer -ErrorAction Stop
+                                $scsiLuns = @(Get-ScsiLun -VMHost $hostObj -Server $localServer -ErrorAction Stop)
 
-                            foreach ($lun in $scsiLuns) {
-                                if ($lun.CanonicalName) {
-                                    $null = $foundNaas.Add($lun.CanonicalName)
-                                    if ($lun.RuntimeName -match ':L(\d+)$') {
-                                        $lid = [int]$Matches[1]
-                                        if (-not $lunIdMap.ContainsKey($lun.CanonicalName)) {
-                                            $lunIdMap[$lun.CanonicalName] = $lid
+                                foreach ($lun in $scsiLuns) {
+                                    if ($lun.CanonicalName) {
+                                        $null = $foundNaas.Add($lun.CanonicalName)
+                                        if ($lun.RuntimeName -match ':L(\d+)$') {
+                                            $lid = [int]$Matches[1]
+                                            if (-not $lunIdMap.ContainsKey($lun.CanonicalName)) {
+                                                $lunIdMap[$lun.CanonicalName] = $lid
+                                            }
                                         }
                                     }
                                 }
-                            }
 
-                            if ($scsiLuns.Count -gt 0) {
-                                $lunPaths = @(Get-ScsiLunPath -ScsiLun $scsiLuns -ErrorAction SilentlyContinue)
-                                foreach ($path in $lunPaths) {
-                                    $cn    = $path.ScsiLun?.CanonicalName
-                                    $sanId = $path.SanId
-                                    if ($cn -and $sanId -and -not $sanIdMap.ContainsKey($cn)) {
-                                        $sanIdMap[$cn] = $sanId
+                                if ($scsiLuns.Count -gt 0) {
+                                    $lunPaths = @(Get-ScsiLunPath -ScsiLun $scsiLuns -ErrorAction SilentlyContinue)
+                                    foreach ($path in $lunPaths) {
+                                        $cn    = $path.ScsiLun?.CanonicalName
+                                        $sanId = $path.SanId
+                                        if ($cn -and $sanId -and -not $sanIdMap.ContainsKey($cn)) {
+                                            $sanIdMap[$cn] = $sanId
+                                        }
                                     }
                                 }
-                            }
 
-                            $allFound = $true
-                            foreach ($naa in $expectedNaas) {
-                                if (-not $foundNaas.Contains($naa)) { $allFound = $false; break }
-                            }
-                            if ($allFound) { $success = $true; break }
+                                $allFound = $true
+                                foreach ($naa in $expectedNaas) {
+                                    if (-not $foundNaas.Contains($naa)) { $allFound = $false; break }
+                                }
+                                if ($allFound) { $success = $true; break }
 
-                        } catch {
-                            $errorMsg = $_.Exception.Message
+                            } catch {
+                                $errorMsg = $_.Exception.Message
+                                Write-Host "  [LUN] $clKey — $hostName error: $errorMsg"
+                            }
                         }
-                    }
 
-                } finally {
-                    if ($localServer) {
-                        try { Disconnect-VIServer -Server $localServer -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                    } finally {
+                        if ($localServer) {
+                            try { Disconnect-VIServer -Server $localServer -Confirm:$false -ErrorAction SilentlyContinue } catch {}
+                        }
                     }
                 }
 
