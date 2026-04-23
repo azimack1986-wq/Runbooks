@@ -168,7 +168,7 @@ foreach ($vcServer in $vCenterServers) {
                     $sanLuns = @($allLuns | Where-Object { $_.CanonicalName -like 'naa.*' })
 
                     if ($sanLuns.Count -eq 0) {
-                        Write-Host "  [SCAN] $clKey — $hostName: no SAN LUNs found"
+                        Write-Host "  [SCAN] $clKey — $hostName : no SAN LUNs found"
                         continue
                     }
 
