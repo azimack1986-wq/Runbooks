@@ -556,6 +556,7 @@ foreach ($vcServer in $vCenterServers) {
 
                 $hostsToTry = @($hostsForCluster | Select-Object -First $maxRetries)
 
+                Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum 2000)
                 $localServer = $null
                 try {
                     $localServer = Connect-VIServer -Server $vcServer -Credential $cred -NotDefault -ErrorAction Stop
