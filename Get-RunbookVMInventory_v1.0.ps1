@@ -579,7 +579,7 @@ foreach ($vcServer in $vCenterServers) {
                             }
 
                             if ($scsiLuns.Count -gt 0) {
-                                $lunPaths = @(Get-ScsiLunPath -ScsiLun $scsiLuns -Server $localServer -ErrorAction SilentlyContinue)
+                                $lunPaths = @(Get-ScsiLunPath -ScsiLun $scsiLuns -ErrorAction SilentlyContinue)
                                 foreach ($path in $lunPaths) {
                                     $cn    = $path.ScsiLun?.CanonicalName
                                     $sanId = $path.SanId
