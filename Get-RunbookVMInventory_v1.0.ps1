@@ -454,13 +454,13 @@ foreach ($vcServer in $vCenterServers) {
         Write-Host "`nBuilding RDM NAA lookup..."
         $rdmNaaLookup = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
         try {
-            $allRdms = @($filteredVMs | Get-HardDisk -DiskType RawPhysical,RawVirtual -ErrorAction SilentlyContinue)
+            $allRdms = @($filteredVMs | Get-HardDisk -DiskType RawPhysical,RawVirtual -ErrorAction Stop)
             foreach ($rdm in $allRdms) {
                 $key = "$($rdm.Parent.Name)|$($rdm.ExtensionData.ControllerKey):$($rdm.ExtensionData.UnitNumber)"
                 if (-not $rdmNaaLookup.ContainsKey($key)) { $rdmNaaLookup[$key] = $rdm.ScsiCanonicalName }
             }
             Write-Host "  [$($rdmNaaLookup.Count)] RDM NAA mappings"
-        } catch { Write-Host "  Warning: RDM NAA lookup unavailable" }
+        } catch { Write-Host "  Warning: RDM NAA lookup failed — $($_.Exception.Message)" }
 
         Write-Host "`nBuilding cluster host map..."
         $clusterHostMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
@@ -502,12 +502,18 @@ foreach ($vcServer in $vCenterServers) {
 
         Write-Host "`nAnalysing RDM distribution across clusters..."
         $expectedNaaByCluster = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+        $noHostRdmVMs         = [System.Collections.Generic.List[string]]::new()
         foreach ($rdmKey in $rdmNaaLookup.Keys) {
             $vmName = $rdmKey.Split('|')[0]
             if (-not $vmClusterKeyMap.ContainsKey($vmName)) { continue }
             $clKey  = $vmClusterKeyMap[$vmName]
             $naa    = $rdmNaaLookup[$rdmKey]
             if (-not $naa) { continue }
+
+            if ($clKey -eq '__no_host__') {
+                if (-not $noHostRdmVMs.Contains($vmName)) { $noHostRdmVMs.Add($vmName) }
+                continue
+            }
 
             if (-not $expectedNaaByCluster.ContainsKey($clKey)) {
                 $expectedNaaByCluster[$clKey] = [System.Collections.Generic.HashSet[string]]::new(
@@ -517,9 +523,14 @@ foreach ($vcServer in $vCenterServers) {
             $null = $expectedNaaByCluster[$clKey].Add($naa)
         }
 
-        $rdmClusterKeys = @($expectedNaaByCluster.Keys)
+        if ($noHostRdmVMs.Count -gt 0) {
+            Write-Host "  Warning: $($noHostRdmVMs.Count) RDM-bearing VM(s) have no runtime host — LUN IDs cannot be resolved: $($noHostRdmVMs -join ', ')"
+        }
+
+        $rdmClusterKeys    = @($expectedNaaByCluster.Keys)
+        $noRdmClusterCount = ($clusterHostMap.Keys | Where-Object { $rdmClusterKeys -notcontains $_ }).Count
         Write-Host "  [$($rdmClusterKeys.Count)] clusters have RDMs — LUN scan required"
-        Write-Host "  [$($clusterHostMap.Count - $rdmClusterKeys.Count)] clusters without RDMs — LUN scan skipped"
+        Write-Host "  [$noRdmClusterCount] clusters without RDMs — LUN scan skipped"
 
         Write-Host "`nStarting parallel LUN scan (ThrottleLimit=$ThrottleLimit)..."
 
@@ -528,6 +539,7 @@ foreach ($vcServer in $vCenterServers) {
 
         if ($rdmClusterKeys.Count -gt 0) {
             $lunScanResults = $rdmClusterKeys | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
+                Import-Module VMware.VimAutomation.Core -ErrorAction SilentlyContinue
                 $clKey           = $_
                 $hostsForCluster = ($using:clusterHostNameMap)[$clKey]
                 $expectedNaas    = ($using:expectedNaaByCluster)[$clKey]
@@ -567,7 +579,7 @@ foreach ($vcServer in $vCenterServers) {
                             }
 
                             if ($scsiLuns.Count -gt 0) {
-                                $lunPaths = @(Get-ScsiLunPath -ScsiLun $scsiLuns -Server $localServer -ErrorAction SilentlyContinue)
+                                $lunPaths = @(Get-ScsiLunPath -ScsiLun $scsiLuns -ErrorAction SilentlyContinue)
                                 foreach ($path in $lunPaths) {
                                     $cn    = $path.ScsiLun?.CanonicalName
                                     $sanId = $path.SanId
