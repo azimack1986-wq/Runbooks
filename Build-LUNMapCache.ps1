@@ -1,29 +1,31 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Builds a persistent LUN map cache by scanning representative hosts per cluster.
+    Builds a persistent LUN map cache using the vCenter View API only — no
+    per-host connections, no Get-ScsiLun, no Get-ScsiLunPath.
 
 .DESCRIPTION
-    For each cluster across all configured vCenters:
+    For each cluster (and each standalone host) across all configured vCenters:
 
-    1. Performs a single batch View call to retrieve the SAN device count for every
-       connected host. No individual host connections at this stage.
+    1. Performs a single batch View call per host pulling
+       Config.StorageDevice.ScsiLun and Config.StorageDevice.MultipathInfo.
+       No host connections — all data comes from the vCenter API.
 
-    2. Groups hosts by device count. Hosts with the same count share identical LUN
-       visibility — only one representative per unique count is scanned.
+    2. Joins ScsiLun.Uuid to MultipathInfo.Lun.Id, then extracts:
+         - CanonicalName (NAA)              from ScsiLun
+         - LunId                            from MultipathInfo path name (vmhbaX:CY:TZ:LNN)
+         - SanId (iSCSI IQN or FC WWN)      from MultipathInfo path Transport
+         - Uuid                             from ScsiLun (for future bridge use)
 
-    3. Checks if all NAAs for the representative are already in today's cache.
-       If so, the cluster is skipped entirely (resume support).
+    3. Resume support: if every NAA seen across the cluster is already in
+       today's cache, the cluster is skipped (only LastSeen is touched).
 
-    4. Scans selected representatives in parallel (ThrottleLimit) using
-       Get-ScsiLun and Get-ScsiLunPath to collect LUN ID and SAN ID.
+    4. Cache is written to disk after every cluster. A session drop preserves
+       all completed clusters and they are skipped on the next run.
 
-    5. Merges results and writes cache to disk immediately after each cluster.
-       If the session is interrupted, all completed clusters are preserved and
-       skipped on the next run.
-
-    UUID data is pulled from the View API per host (more reliable than
-    Get-ScsiLun.Uuid) and stored in the cache for future bridge use.
+    Deduplication is by CanonicalName — each unique LUN stored once, regardless
+    of how many hosts/clusters can see it. Existing entries are preserved;
+    LastSeen is refreshed and missing fields are filled in opportunistically.
 
 .PARAMETER OutputPath
     UNC or local path where LUNMap_Cache.json will be written.
@@ -44,7 +46,6 @@ $vCenterServers = @(
     'vcenter02.domain.local'
     'vcenter03.domain.local'
 )
-$ThrottleLimit = 10   # Max parallel representative host scans per cluster
 # ═════════════════════════════════════════════════════════════════════════════
 
 $ErrorActionPreference = 'Stop'
@@ -122,12 +123,12 @@ foreach ($vcServer in $vCenterServers) {
             $label = $unit.Label
             Write-Host "`n  [$unitIndex/$($scanUnits.Count)] $label"
 
-            # ── Step 1: Batch View call — device count + NAAs + UUID per host ─
+            # ── Step 1: Batch View call per host — ScsiLun + MultipathInfo ────
             $hostProfiles = [System.Collections.Generic.List[object]]::new()
 
             foreach ($hostId in $unit.HostIds) {
                 $hView = Get-View -Id $hostId `
-                    -Property @('Name', 'Runtime.ConnectionState', 'Config.StorageDevice.ScsiLun') `
+                    -Property @('Name', 'Runtime.ConnectionState', 'Config.StorageDevice.ScsiLun', 'Config.StorageDevice.MultipathInfo') `
                     -ErrorAction SilentlyContinue
                 if (-not $hView -or $hView.Runtime.ConnectionState -ne 'connected') { continue }
 
@@ -135,10 +136,44 @@ foreach ($vcServer in $vCenterServers) {
                     $_.CanonicalName -like 'naa.*' -and $_.LunType -eq 'disk'
                 })
 
+                # Uuid → CanonicalName map for joining to MultipathInfo
+                $uuidToNaa = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
+                foreach ($lv in $sanLunViews) {
+                    if ($lv.CanonicalName -and $lv.Uuid) {
+                        $uuidToNaa[$lv.Uuid] = $lv.CanonicalName
+                    }
+                }
+
+                # Extract LunId + SanId from MultipathInfo
+                $hostLunData = [System.Collections.Generic.List[object]]::new()
+                foreach ($mpLun in $hView.Config.StorageDevice.MultipathInfo.Lun) {
+                    $naa = $uuidToNaa[$mpLun.Id]
+                    if (-not $naa) { continue }
+
+                    $lunId = $null
+                    $sanId = $null
+
+                    if ($mpLun.Path -and $mpLun.Path.Count -gt 0) {
+                        if ($mpLun.Path[0].Name -match ':L(\d+)$') { $lunId = [int]$Matches[1] }
+
+                        foreach ($p in $mpLun.Path) {
+                            if ($p.Transport.IScsiName)         { $sanId = $p.Transport.IScsiName;         break }
+                            if ($p.Transport.PortWorldWideName) { $sanId = $p.Transport.PortWorldWideName; break }
+                        }
+                    }
+
+                    $hostLunData.Add([PSCustomObject]@{
+                        CanonicalName = $naa
+                        LunId         = $lunId
+                        SanId         = $sanId
+                        Uuid          = $mpLun.Id
+                    })
+                }
+
                 $hostProfiles.Add([PSCustomObject]@{
-                    Name         = $hView.Name
-                    DeviceCount  = $sanLunViews.Count
-                    LunViewItems = $sanLunViews
+                    Name        = $hView.Name
+                    DeviceCount = $sanLunViews.Count
+                    LunData     = $hostLunData
                 })
             }
 
@@ -147,126 +182,42 @@ foreach ($vcServer in $vCenterServers) {
                 continue
             }
 
-            Write-Host "    [$($hostProfiles.Count)] connected hosts"
-
-            # ── Step 2: Group by device count ─────────────────────────────────
-            $countGroups = $hostProfiles | Group-Object DeviceCount | Sort-Object { [int]$_.Name }
+            # ── Step 2: Informational — host count grouping ───────────────────
+            $countGroups  = $hostProfiles | Group-Object DeviceCount | Sort-Object { [int]$_.Name }
             $groupSummary = $countGroups | ForEach-Object { "$($_.Name) LUNs x$($_.Count) host(s)" }
-            Write-Host "    Groups: $($groupSummary -join ' | ')"
+            Write-Host "    [$($hostProfiles.Count)] hosts — $($groupSummary -join ' | ')"
 
-            # ── Step 3: Resume check ──────────────────────────────────────────
-            # Use the largest group's representative — if all its NAAs are in today's cache, skip
-            $largestGroup   = $countGroups | Sort-Object { $_.Count } -Descending | Select-Object -First 1
-            $largestGroupRep = $largestGroup.Group[0]
-            $repNaas        = @($largestGroupRep.LunViewItems | Select-Object -ExpandProperty CanonicalName)
+            # ── Step 3: Resume check — skip cluster if all NAAs in today's cache
+            $allNaas = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+            foreach ($profile in $hostProfiles) {
+                foreach ($entry in $profile.LunData) {
+                    if ($entry.CanonicalName) { $null = $allNaas.Add($entry.CanonicalName) }
+                }
+            }
 
-            if ($repNaas.Count -gt 0) {
-                $uncached = @($repNaas | Where-Object { -not $lunCache.ContainsKey($_) -or $lunCache[$_].LastSeen -ne $today })
+            if ($allNaas.Count -gt 0) {
+                $uncached = @($allNaas | Where-Object { -not $lunCache.ContainsKey($_) -or $lunCache[$_].LastSeen -ne $today })
                 if ($uncached.Count -eq 0) {
-                    Write-Host "    All $($repNaas.Count) NAAs in today's cache — skipping"
-                    foreach ($profile in $hostProfiles) {
-                        foreach ($lv in $profile.LunViewItems) {
-                            if ($lunCache.ContainsKey($lv.CanonicalName)) {
-                                $lunCache[$lv.CanonicalName].LastSeen = $today
-                            }
-                        }
+                    Write-Host "    All $($allNaas.Count) NAAs in today's cache — skipping merge"
+                    foreach ($naa in $allNaas) {
+                        if ($lunCache.ContainsKey($naa)) { $lunCache[$naa].LastSeen = $today }
                     }
                     continue
                 }
             }
 
-            # ── Step 4: One representative per unique device count ─────────────
-            $representatives = @($countGroups | ForEach-Object { $_.Group[0].Name })
-            Write-Host "    Scanning $($representatives.Count) representative(s): $($representatives -join ', ')"
-
-            # ── Step 5: UUID map from View data (all hosts, first seen wins) ───
-            $uuidMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
-            foreach ($profile in $hostProfiles) {
-                foreach ($lv in $profile.LunViewItems) {
-                    if ($lv.CanonicalName -and $lv.Uuid -and -not $uuidMap.ContainsKey($lv.CanonicalName)) {
-                        $uuidMap[$lv.CanonicalName] = $lv.Uuid
-                    }
-                }
-            }
-
-            # ── Step 6: Parallel scan of representatives ───────────────────────
-            $scanResults = $representatives | ForEach-Object -ThrottleLimit $ThrottleLimit -Parallel {
-
-                Import-Module VMware.VimAutomation.Core -ErrorAction SilentlyContinue
-
-                $hostName = $_
-                $vcServer = $using:vcServer
-                $cred     = $using:credential
-
-                $lunEntries = [System.Collections.Generic.List[object]]::new()
-
-                Start-Sleep -Milliseconds (Get-Random -Minimum 0 -Maximum 2000)
-
-                $localServer = $null
-                try {
-                    if (-not (Test-Connection -TargetName $hostName -Count 1 -TimeoutSeconds 2 -Quiet)) {
-                        Write-Host "    [SCAN] $hostName — unreachable (ping), skipping"
-                        return [PSCustomObject]@{ HostName = $hostName; LunEntries = $lunEntries }
-                    }
-
-                    Write-Host "    [SCAN] $hostName — connecting..."
-                    $localServer = Connect-VIServer -Server $vcServer -Credential $cred -NotDefault -ErrorAction Stop
-
-                    Write-Host "    [SCAN] $hostName — scanning..."
-                    $hostObj = Get-VMHost -Name $hostName -Server $localServer -ErrorAction Stop
-                    $allLuns = @(Get-ScsiLun -VMHost $hostObj -LunType disk -Server $localServer -ErrorAction Stop)
-                    $sanLuns = @($allLuns | Where-Object { $_.CanonicalName -like 'naa.*' })
-
-                    if ($sanLuns.Count -eq 0) {
-                        Write-Host "    [SCAN] $hostName — no SAN LUNs found"
-                        return [PSCustomObject]@{ HostName = $hostName; LunEntries = $lunEntries }
-                    }
-
-                    $sanIdMap = [System.Collections.Hashtable]::new([System.StringComparer]::OrdinalIgnoreCase)
-                    $lunPaths = @(Get-ScsiLunPath -ScsiLun $sanLuns -ErrorAction SilentlyContinue)
-                    foreach ($path in $lunPaths) {
-                        $cn = $path.ScsiLun?.CanonicalName
-                        if ($cn -and $path.SanId -and -not $sanIdMap.ContainsKey($cn)) {
-                            $sanIdMap[$cn] = $path.SanId
-                        }
-                    }
-
-                    foreach ($lun in $sanLuns) {
-                        $lunId = $null
-                        if ($lun.RuntimeName -match ':L(\d+)$') { $lunId = [int]$Matches[1] }
-                        $lunEntries.Add([PSCustomObject]@{
-                            CanonicalName = $lun.CanonicalName
-                            LunId         = $lunId
-                            SanId         = $sanIdMap[$lun.CanonicalName]
-                        })
-                    }
-
-                    Write-Host "    [SCAN] $hostName — $($sanLuns.Count) SAN LUNs"
-
-                } catch {
-                    Write-Host "    [SCAN] $hostName — error: $($_.Exception.Message)"
-                } finally {
-                    if ($localServer) {
-                        try { Disconnect-VIServer -Server $localServer -Confirm:$false -ErrorAction SilentlyContinue } catch {}
-                    }
-                }
-
-                [PSCustomObject]@{ HostName = $hostName; LunEntries = $lunEntries }
-            }
-
-            # ── Step 7: Merge into cache ───────────────────────────────────────
+            # ── Step 4: Merge into cache ──────────────────────────────────────
             $added   = 0
             $updated = 0
 
-            foreach ($result in $scanResults) {
-                if (-not $result) { continue }
-                foreach ($entry in $result.LunEntries) {
+            foreach ($profile in $hostProfiles) {
+                foreach ($entry in $profile.LunData) {
                     if (-not $entry.CanonicalName) { continue }
                     if (-not $lunCache.ContainsKey($entry.CanonicalName)) {
                         $lunCache[$entry.CanonicalName] = @{
                             LunId    = $entry.LunId
                             SanId    = $entry.SanId
-                            Uuid     = $uuidMap[$entry.CanonicalName]
+                            Uuid     = $entry.Uuid
                             vCenter  = $vcServer
                             LastSeen = $today
                         }
@@ -274,9 +225,9 @@ foreach ($vcServer in $vCenterServers) {
                         $vcNewEntries++
                     } else {
                         $lunCache[$entry.CanonicalName].LastSeen = $today
-                        if ($entry.LunId  -and -not $lunCache[$entry.CanonicalName].LunId)  { $lunCache[$entry.CanonicalName].LunId  = $entry.LunId }
-                        if ($entry.SanId  -and -not $lunCache[$entry.CanonicalName].SanId)  { $lunCache[$entry.CanonicalName].SanId  = $entry.SanId }
-                        if ($uuidMap[$entry.CanonicalName] -and -not $lunCache[$entry.CanonicalName].Uuid) { $lunCache[$entry.CanonicalName].Uuid = $uuidMap[$entry.CanonicalName] }
+                        if ($entry.LunId -and -not $lunCache[$entry.CanonicalName].LunId) { $lunCache[$entry.CanonicalName].LunId = $entry.LunId }
+                        if ($entry.SanId -and -not $lunCache[$entry.CanonicalName].SanId) { $lunCache[$entry.CanonicalName].SanId = $entry.SanId }
+                        if ($entry.Uuid  -and -not $lunCache[$entry.CanonicalName].Uuid)  { $lunCache[$entry.CanonicalName].Uuid  = $entry.Uuid }
                         $updated++
                     }
                 }
@@ -284,7 +235,7 @@ foreach ($vcServer in $vCenterServers) {
 
             Write-Host "    +$added new, $updated updated (cache total: $($lunCache.Count))"
 
-            # ── Step 8: Write cache after every cluster ────────────────────────
+            # ── Step 5: Write cache after every cluster ───────────────────────
             try {
                 $lunCache | ConvertTo-Json -Depth 3 | Set-Content $CachePath -Encoding UTF8
             } catch {
