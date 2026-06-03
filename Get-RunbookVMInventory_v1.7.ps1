@@ -299,6 +299,7 @@ function Write-VMExport {
             $ds = $null
             if ($disk.FileName -match '^\[(.+?)\]') { $ds = $Matches[1] }
             [ordered]@{
+                FileName              = $disk.FileName
                 SizeGB                = $disk.SizeGB
                 DiskType              = $disk.DiskType
                 Datastore             = $ds
